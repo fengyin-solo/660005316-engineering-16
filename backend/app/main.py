@@ -1,17 +1,53 @@
-import asyncio, math, random, time, json, threading
+import asyncio, math, random, time, json, threading, os
 from collections import defaultdict, deque
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import numpy as np
+from dotenv import load_dotenv
+
+# 联调口径统一来自环境配置：backend/.env（示例见 .env.example），
+# 进程已存在的同名环境变量优先，不在代码里写死地址/端口。
+load_dotenv()
+
+
+class Settings:
+    """进程级配置：所有地址、端口、数据通道路径的唯一来源。"""
+
+    def __init__(self):
+        self.backend_host = os.getenv("BACKEND_HOST", "127.0.0.1")
+        self.backend_port = int(os.getenv("BACKEND_PORT", "8000"))
+        self.cors_origins = [
+            o.strip()
+            for o in os.getenv(
+                "BACKEND_CORS_ORIGINS",
+                "http://localhost:3000,http://127.0.0.1:3000",
+            ).split(",")
+            if o.strip()
+        ]
+        # 数据通道路径需与前端 VITE_API_BASE / VITE_WS_PATH 及 Vite 代理一致
+        self.api_prefix = os.getenv("API_PREFIX", "/api").rstrip("/") or "/api"
+        self.ws_path = os.getenv("WS_PATH", "/ws")
+
+
+settings = Settings()
 
 app = FastAPI(title="Digital Twin Factory Monitor")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_origins,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 DEVICE_TYPES = ["CNC", "RobotArm", "Conveyor", "AGV", "InjectionMolding", "QCStation"]
 STATUSES = ["RUNNING", "IDLE", "FAULT", "OFFLINE"]
 ACTIVE_CLIENTS: list[WebSocket] = []
 SIMULATOR_RUNNING = True
+
+# 模拟器线程所在的线程没有事件循环，startup 时把主循环保存下来供其推送使用
+event_loop: asyncio.AbstractEventLoop | None = None
+
 
 class DeviceState:
     def __init__(self, did: int, dtype: str, x: float, y: float, z: float):
@@ -111,18 +147,23 @@ def simulate():
                 "oee": calculate_oee()
             }
             msg = json.dumps(payload)
-        except:
+        except Exception:
+            time.sleep(1)
             continue
 
-        dead = []
-        for ws in ACTIVE_CLIENTS:
-            try:
-                asyncio.run_coroutine_threadsafe(ws.send_text(msg), asyncio.get_event_loop())
-            except:
-                dead.append(ws)
-        for ws in dead:
-            if ws in ACTIVE_CLIENTS:
-                ACTIVE_CLIENTS.remove(ws)
+        # 必须把协程提交回 startup 时捕获的主事件循环；
+        # 子线程内 asyncio.get_event_loop() 拿不到循环，推送会静默丢失
+        if event_loop is not None and ACTIVE_CLIENTS:
+            dead = []
+            for ws in list(ACTIVE_CLIENTS):
+                try:
+                    fut = asyncio.run_coroutine_threadsafe(ws.send_text(msg), event_loop)
+                    fut.result(timeout=2)
+                except Exception:
+                    dead.append(ws)
+            for ws in dead:
+                if ws in ACTIVE_CLIENTS:
+                    ACTIVE_CLIENTS.remove(ws)
 
         time.sleep(1)
 
@@ -151,26 +192,28 @@ class OEEAnalysis(BaseModel):
 
 @app.on_event("startup")
 async def startup():
+    global event_loop
+    event_loop = asyncio.get_running_loop()
     t = threading.Thread(target=simulate, daemon=True)
     t.start()
 
 
-@app.get("/api/devices")
+@app.get(f"{settings.api_prefix}/devices")
 def get_devices():
     return {"devices": [d.to_dict() for d in devices.values()], "anomalies": anomaly_log[-10:]}
 
 
-@app.get("/api/oee")
+@app.get(f"{settings.api_prefix}/oee")
 def get_oee():
     return {"oee": calculate_oee()}
 
 
-@app.get("/api/production")
+@app.get(f"{settings.api_prefix}/production")
 def get_production():
     return {"log": production_log[-60:]}
 
 
-@app.websocket("/ws")
+@app.websocket(settings.ws_path)
 async def ws_endpoint(websocket: WebSocket):
     await websocket.accept()
     ACTIVE_CLIENTS.append(websocket)
@@ -186,3 +229,15 @@ async def ws_endpoint(websocket: WebSocket):
 async def shutdown():
     global SIMULATOR_RUNNING
     SIMULATOR_RUNNING = False
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    # python -m app.main 时同样以配置为准，与 scripts/dev.sh 走同一口径
+    uvicorn.run(
+        "app.main:app",
+        host=settings.backend_host,
+        port=settings.backend_port,
+        reload=False,
+    )

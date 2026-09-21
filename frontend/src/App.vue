@@ -4,8 +4,9 @@
       <h1>🏭 数字孪生工厂产线实时监控系统</h1>
       <div class="status-row">
         <span class="ws-dot" :class="{on: store.connected}"></span>
-        <span>{{ store.connected ? '实时连接中' : '连接断开' }}</span>
+        <span>{{ store.connected ? '实时连接中' : '连接断开（重连中…）' }}</span>
         <span class="prod-count">今日产量: {{ store.data?.production || 0 }}</span>
+        <span v-if="store.lastError" class="conn-error">{{ store.lastError }}</span>
       </div>
     </header>
     <div class="main-grid">
@@ -33,7 +34,10 @@ import TrendPanel from './components/TrendPanel.vue'
 import FaultPie from './components/FaultPie.vue'
 import { useFactoryStore } from './store/factory'
 const store = useFactoryStore()
-onMounted(() => store.connect())
+onMounted(() => {
+  store.loadSnapshot()
+  store.connect()
+})
 onUnmounted(() => store.disconnect())
 </script>
 
@@ -47,6 +51,7 @@ body{font-family:system-ui,sans-serif;background:#0a1628;color:#e0e6ed;overflow-
 .ws-dot{width:10px;height:10px;border-radius:50%;background:#ef4444}
 .ws-dot.on{background:#22c55e;box-shadow:0 0 8px #22c55e}
 .prod-count{color:#fbbf24;font-weight:600}
+.conn-error{color:#f87171;max-width:40%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .main-grid{display:grid;grid-template-columns:1fr 360px;gap:12px;padding:12px 24px;min-height:55vh}
 .scene-col{background:#0d1b2a;border-radius:12px;border:1px solid #1e3a5f;overflow:hidden}
 .panel-col{display:flex;flex-direction:column;gap:12px;overflow-y:auto;max-height:55vh}
