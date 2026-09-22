@@ -5,13 +5,16 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import numpy as np
 
+from app.config import HOST, PORT, CORS_ORIGINS
+
 app = FastAPI(title="Digital Twin Factory Monitor")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(CORSMiddleware, allow_origins=CORS_ORIGINS, allow_methods=["*"], allow_headers=["*"])
 
 DEVICE_TYPES = ["CNC", "RobotArm", "Conveyor", "AGV", "InjectionMolding", "QCStation"]
 STATUSES = ["RUNNING", "IDLE", "FAULT", "OFFLINE"]
 ACTIVE_CLIENTS: list[WebSocket] = []
 SIMULATOR_RUNNING = True
+MAIN_LOOP = None  # 启动时缓存主事件循环，供模拟器线程向 WS 客户端发消息
 
 class DeviceState:
     def __init__(self, did: int, dtype: str, x: float, y: float, z: float):
@@ -115,11 +118,13 @@ def simulate():
             continue
 
         dead = []
-        for ws in ACTIVE_CLIENTS:
-            try:
-                asyncio.run_coroutine_threadsafe(ws.send_text(msg), asyncio.get_event_loop())
-            except:
-                dead.append(ws)
+        loop = MAIN_LOOP
+        if loop is not None:
+            for ws in ACTIVE_CLIENTS:
+                try:
+                    asyncio.run_coroutine_threadsafe(ws.send_text(msg), loop)
+                except Exception:
+                    dead.append(ws)
         for ws in dead:
             if ws in ACTIVE_CLIENTS:
                 ACTIVE_CLIENTS.remove(ws)
@@ -151,8 +156,15 @@ class OEEAnalysis(BaseModel):
 
 @app.on_event("startup")
 async def startup():
+    global MAIN_LOOP
+    MAIN_LOOP = asyncio.get_running_loop()
     t = threading.Thread(target=simulate, daemon=True)
     t.start()
+
+
+@app.get("/api/health")
+def health():
+    return {"status": "ok", "devices": len(devices), "ws_clients": len(ACTIVE_CLIENTS)}
 
 
 @app.get("/api/devices")
@@ -186,3 +198,9 @@ async def ws_endpoint(websocket: WebSocket):
 async def shutdown():
     global SIMULATOR_RUNNING
     SIMULATOR_RUNNING = False
+
+
+if __name__ == "__main__":
+    # python -m app.main —— 地址与端口统一来自 app.config（环境变量 / backend/.env）
+    import uvicorn
+    uvicorn.run(app, host=HOST, port=PORT)
